@@ -56,12 +56,16 @@ df['RSI_10'] = ta.rsi(df['close'], length=10)
 # VWAP
 df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
 
+# Safely extract dynamic Bollinger Band column names to avoid KeyErrors
+lower_bb_col = [col for col in df.columns if col.startswith('BBL')][0]
+upper_bb_col = [col for col in df.columns if col.startswith('BBU')][0]
+
 # Get latest values
 latest = df.iloc[-1]
 current_price = latest['close']
 rsi_val = latest['RSI_10']
-lower_bb = latest['BBL_20_2.0']
-upper_bb = latest['BBU_20_2.0']
+lower_bb = latest[lower_bb_col]
+upper_bb = latest[upper_bb_col]
 
 # --- 5. CHECK ACCOUNT & POSITION (Compounding Engine) ---
 account = trading_client.get_account()
@@ -74,10 +78,8 @@ except Exception:
     current_qty = 0
 
 # Max-Buy Logic (Seed $300 + gains)
-# For the $300 challenge, we reinvest total dedicated equity.
-# Note: You can adjust total_challenge_equity below if you separated the $300 virtually.
-total_challenge_equity = 300.00 # Base tracking, update if tracking dynamically via order ledger
-qty_to_buy = int(buying_power // current_price) # Uses max available cash
+total_challenge_equity = 300.00 
+qty_to_buy = int(buying_power // current_price) if current_price > 0 else 0
 
 # --- 6. EARNINGS BLACKOUT & SIGNAL LOGIC ---
 BLACKOUT_START = EST.localize(datetime.datetime(2026, 5, 4, 0, 0, 0))
@@ -108,7 +110,7 @@ else:
         reason = f"RSI ({rsi_val:.2f}) > 70 AND Price (${current_price:.2f}) > Upper BB."
 
 # --- 7. ORDER EXECUTION ---
-if signal == "BUY":
+if signal == "BUY" and qty_to_buy > 0:
     try:
         buy_order = MarketOrderRequest(
             symbol="NRDS",
@@ -121,7 +123,7 @@ if signal == "BUY":
     except Exception as e:
         st.error(f"Buy failed: {e}")
 
-elif signal in ["SELL", "SELL_LIQUIDATE"]:
+elif signal in ["SELL", "SELL_LIQUIDATE"] and current_qty > 0:
     try:
         sell_order = MarketOrderRequest(
             symbol="NRDS",
@@ -156,8 +158,8 @@ fig.add_trace(go.Candlestick(x=df.index,
 fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], line=dict(color='orange', width=2), name='VWAP'))
 
 # Bollinger Bands
-fig.add_trace(go.Scatter(x=df.index, y=df['BBU_20_2.0'], line=dict(color='gray', width=1, dash='dash'), name='Upper BB'))
-fig.add_trace(go.Scatter(x=df.index, y=df['BBL_20_2.0'], line=dict(color='gray', width=1, dash='dash'), name='Lower BB', fill='tonexty', fillcolor='rgba(128,128,128,0.1)'))
+fig.add_trace(go.Scatter(x=df.index, y=df[upper_bb_col], line=dict(color='gray', width=1, dash='dash'), name='Upper BB'))
+fig.add_trace(go.Scatter(x=df.index, y=df[lower_bb_col], line=dict(color='gray', width=1, dash='dash'), name='Lower BB', fill='tonexty', fillcolor='rgba(128,128,128,0.1)'))
 
 fig.update_layout(title="NRDS Live Chart - 1 Min", xaxis_title="Time", yaxis_title="Price ($)", template="plotly_dark", xaxis_rangeslider_visible=False, height=600)
 st.plotly_chart(fig, use_container_width=True)
