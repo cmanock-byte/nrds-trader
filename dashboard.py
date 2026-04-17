@@ -29,7 +29,7 @@ data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 # --- 3. FETCH DATA (Alpaca IEX 1-Min Data) ---
 EST = pytz.timezone('America/New_York')
 end_time = datetime.datetime.now(EST)
-start_time = end_time - datetime.timedelta(days=3) 
+start_time = end_time - datetime.timedelta(days=3)
 
 request_params = StockBarsRequest(
     symbol_or_symbols="NRDS",
@@ -45,9 +45,14 @@ df.set_index('timestamp', inplace=True)
 df.index = df.index.tz_convert('America/New_York')
 
 # --- 4. CALCULATE INDICATORS ---
+# Bollinger Bands (20, 2) - standard settings
 bbands = ta.bbands(df['close'], length=20, std=2)
 df = pd.concat([df, bbands], axis=1)
-df['RSI_10'] = ta.rsi(df['close'], length=10)
+
+# RSI (6) - shortened from 10 for faster 1-min scalping signals
+df['RSI_6'] = ta.rsi(df['close'], length=6)
+
+# VWAP
 df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
 
 # Safely extract dynamic Bollinger Band column names to avoid KeyErrors
@@ -56,12 +61,11 @@ upper_bb_col = [col for col in df.columns if col.startswith('BBU')][0]
 
 latest = df.iloc[-1]
 current_price = latest['close']
-rsi_val = latest['RSI_10']
+rsi_val = latest['RSI_6']
 lower_bb = latest[lower_bb_col]
 upper_bb = latest[upper_bb_col]
 
 # --- 5. $300 CHALLENGE PERSISTENT LEDGER ---
-# Fetch closed orders to reconstruct the challenge ledger
 orders_req = GetOrdersRequest(
     status=QueryOrderStatus.CLOSED,
     symbols=["NRDS"],
@@ -79,7 +83,7 @@ for o in closed_orders:
             "Avg Price": float(o.filled_avg_price),
             "Status": o.status.name
         })
-        
+
 ledger_df = pd.DataFrame(trade_data)
 if not ledger_df.empty:
     ledger_df = ledger_df.sort_values("Time").reset_index(drop=True)
@@ -92,7 +96,7 @@ if not ledger_df.empty:
     holdings = 0
     avg_cost = 0
     realized_pnl = 0
-    
+
     for idx, row in ledger_df.iterrows():
         qty = row["Qty"]
         price = row["Avg Price"]
@@ -106,12 +110,12 @@ if not ledger_df.empty:
             holdings -= qty
             if holdings == 0:
                 avg_cost = 0
-        
+
         equity_curve.append({
             "Time": row["Time"],
             "Equity": 300.00 + realized_pnl
         })
-        
+
     current_challenge_equity = 300.00 + realized_pnl
 
 equity_df = pd.DataFrame(equity_curve)
@@ -145,12 +149,32 @@ if is_blackout_active:
         signal = "STANDBY"
         reason = "Bot paused for earnings. Manual trading enabled."
 else:
-    if rsi_val < 30 and current_price < lower_bb:
+    # -----------------------------------------------------------
+    # MEAN REVERSION LOGIC (TUNED FOR 1-MIN BARS)
+    # Buy when EITHER condition fires (OR logic):
+    #   - RSI(6) drops below 30 (oversold momentum)
+    #   - Price drops below Lower Bollinger Band (price extreme)
+    # Sell when EITHER condition fires (OR logic):
+    #   - RSI(6) rises above 70 (overbought momentum)
+    #   - Price rises above Upper Bollinger Band (price extreme)
+    # -----------------------------------------------------------
+    if current_qty == 0 and (rsi_val < 30 or current_price < lower_bb):
         signal = "BUY"
-        reason = f"RSI ({rsi_val:.2f}) < 30 AND Price (${current_price:.2f}) < Lower BB."
-    elif current_qty > 0 and (rsi_val > 70 and current_price > upper_bb):
+        reasons = []
+        if rsi_val < 30:
+            reasons.append(f"RSI ({rsi_val:.2f}) < 30")
+        if current_price < lower_bb:
+            reasons.append(f"Price (${current_price:.2f}) < Lower BB (${lower_bb:.2f})")
+        reason = "BUY Signal: " + " | ".join(reasons)
+
+    elif current_qty > 0 and (rsi_val > 70 or current_price > upper_bb):
         signal = "SELL"
-        reason = f"RSI ({rsi_val:.2f}) > 70 AND Price (${current_price:.2f}) > Upper BB."
+        reasons = []
+        if rsi_val > 70:
+            reasons.append(f"RSI ({rsi_val:.2f}) > 70")
+        if current_price > upper_bb:
+            reasons.append(f"Price (${current_price:.2f}) > Upper BB (${upper_bb:.2f})")
+        reason = "SELL Signal: " + " | ".join(reasons)
 
 # --- 7. ORDER EXECUTION ---
 if signal == "BUY" and qty_to_buy > 0:
@@ -175,7 +199,7 @@ elif signal in ["SELL", "SELL_LIQUIDATE"] and current_qty > 0:
             time_in_force=TimeInForce.DAY
         )
         trading_client.submit_order(order_data=sell_order)
-        st.success(f"Executed SELL for {current_qty} shares. Reason: {reason}")
+        st.success(f"Executed SELL for {current_qty} shares. {reason}")
     except Exception as e:
         st.error(f"Sell failed: {e}")
 
@@ -191,7 +215,7 @@ st.subheader("Live Market Signals")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Current Price", f"${current_price:.2f}")
 col2.metric("Target Buy Qty (Max Buy)", f"{qty_to_buy} Shares")
-col3.metric("RSI (10)", f"{rsi_val:.2f}")
+col3.metric("RSI (6)", f"{rsi_val:.2f}")
 col4.metric("Current Signal", signal)
 st.write(f"**Bot Status:** {reason}")
 
