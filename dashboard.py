@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import pandas_ta as ta
@@ -13,63 +12,177 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-# --- 1. PAGE SETUP & AUTOREFRESH ---
-st.set_page_config(page_title="NRDS Mean Reversion Bot", layout="wide")
-st.title("NRDS $300 Challenge Dashboard 📈")
+# ================================================================
+# 1. PAGE SETUP & AUTOREFRESH
+# ================================================================
+st.set_page_config(page_title="NRDS Trading Bot", layout="wide")
+st.title("NRDS Trading Bot 📈")
 
 # Auto-refresh every 30 seconds
 count = st_autorefresh(interval=30000, limit=None, key="data_refresh")
 
-# --- 2. API KEYS & CLIENTS ---
+# ================================================================
+# 2. API KEYS, MODE & CLIENTS
+# ================================================================
 API_KEY = st.secrets["ALPACA_API_KEY"]
 SECRET_KEY = st.secrets["ALPACA_SECRET_KEY"]
+PAPER_MODE = st.secrets.get("PAPER_MODE", "true").lower() == "true"
+SEED_CAPITAL = float(st.secrets.get("SEED_CAPITAL", "300"))
 
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_MODE)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-# --- 3. FETCH DATA (Alpaca IEX 1-Min Data) ---
+# Mode indicator banner
+if PAPER_MODE:
+    st.success("📝 **PAPER TRADING MODE** - Simulated trades, no real money at risk.")
+else:
+    st.error("🔴 **LIVE TRADING MODE** - Real money. Real consequences.")
+
+# ================================================================
+# 3. TICKER CONFIGURATION
+#
+# This is the brain of the bot. Each ticker gets its own tuning
+# parameters. The order matters - tickers listed first get
+# priority when multiple BUY signals fire at the same time.
+#
+# To add a new ticker: copy any block, change the symbol and
+# adjust the numbers. To remove one: delete its block.
+#
+# bb_std        = Bollinger Band width (lower = tighter = more signals)
+# rsi_buy       = Buy when RSI drops below this number
+# rsi_sell      = Sell when RSI rises above this number
+# profit_target = Sell when price rises this much above entry price
+# blackout_start/end = Earnings protection window (set to None if unknown)
+# ================================================================
 EST = pytz.timezone('America/New_York')
+
+TICKERS = {
+    "NRDS": {
+        "bb_std": 1.5,
+        "rsi_buy": 35,
+        "rsi_sell": 65,
+        "profit_target": 0.08,
+        "blackout_start": EST.localize(datetime.datetime(2026, 5, 4, 0, 0, 0)),
+        "blackout_end": EST.localize(datetime.datetime(2026, 5, 13, 23, 59, 59)),
+    },
+    "OPFI": {
+        "bb_std": 1.5,
+        "rsi_buy": 35,
+        "rsi_sell": 65,
+        "profit_target": 0.08,
+        "blackout_start": EST.localize(datetime.datetime(2026, 5, 4, 0, 0, 0)),
+        "blackout_end": EST.localize(datetime.datetime(2026, 5, 13, 23, 59, 59)),
+    },
+    "PTON": {
+        "bb_std": 1.2,
+        "rsi_buy": 30,
+        "rsi_sell": 60,
+        "profit_target": 0.06,
+        "blackout_start": None,
+        "blackout_end": None,
+    },
+    "OPEN": {
+        "bb_std": 1.8,
+        "rsi_buy": 30,
+        "rsi_sell": 60,
+        "profit_target": 0.10,
+        "blackout_start": None,
+        "blackout_end": None,
+    },
+    "PENN": {
+        "bb_std": 1.5,
+        "rsi_buy": 35,
+        "rsi_sell": 65,
+        "profit_target": 0.12,
+        "blackout_start": None,
+        "blackout_end": None,
+    },
+    "PUBM": {
+        "bb_std": 1.5,
+        "rsi_buy": 35,
+        "rsi_sell": 65,
+        "profit_target": 0.08,
+        "blackout_start": None,
+        "blackout_end": None,
+    },
+}
+
+# ================================================================
+# 4. FETCH 1-MINUTE DATA FOR ALL TICKERS
+# ================================================================
 end_time = datetime.datetime.now(EST)
 start_time = end_time - datetime.timedelta(days=3)
 
-request_params = StockBarsRequest(
-    symbol_or_symbols="NRDS",
-    timeframe=TimeFrame.Minute,
-    start=start_time,
-    end=end_time,
-    feed="iex"
-)
+ticker_data = {}
 
-bars = data_client.get_stock_bars(request_params)
-df = bars.df.reset_index()
-df.set_index('timestamp', inplace=True)
-df.index = df.index.tz_convert('America/New_York')
+for symbol, config in TICKERS.items():
+    try:
+        request_params = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=start_time,
+            end=end_time,
+            feed="iex"
+        )
+        bars = data_client.get_stock_bars(request_params)
+        df = bars.df.reset_index()
+        df.set_index('timestamp', inplace=True)
+        df.index = df.index.tz_convert('America/New_York')
 
-# --- 4. CALCULATE INDICATORS ---
-# Bollinger Bands (20, 1.5) - tightened for more frequent scalping signals
-bbands = ta.bbands(df['close'], length=20, std=1.5)
-df = pd.concat([df, bbands], axis=1)
+        # Bollinger Bands (20 period, custom std per ticker)
+        bbands = ta.bbands(df['close'], length=20, std=config["bb_std"])
+        df = pd.concat([df, bbands], axis=1)
 
-# RSI (6) - short period for fast 1-min scalping signals
-df['RSI_6'] = ta.rsi(df['close'], length=6)
+        # RSI (6 period - fast, for 1-min scalping)
+        df['RSI_6'] = ta.rsi(df['close'], length=6)
 
-# VWAP
-df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
+        # VWAP
+        df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
 
-# Safely extract dynamic Bollinger Band column names to avoid KeyErrors
-lower_bb_col = [col for col in df.columns if col.startswith('BBL')][0]
-upper_bb_col = [col for col in df.columns if col.startswith('BBU')][0]
+        # Safely detect dynamic Bollinger Band column names
+        lower_bb_col = [col for col in df.columns if col.startswith('BBL')][0]
+        upper_bb_col = [col for col in df.columns if col.startswith('BBU')][0]
 
-latest = df.iloc[-1]
-current_price = latest['close']
-rsi_val = latest['RSI_6']
-lower_bb = latest[lower_bb_col]
-upper_bb = latest[upper_bb_col]
+        latest = df.iloc[-1]
 
-# --- 5. $300 CHALLENGE PERSISTENT LEDGER ---
+        ticker_data[symbol] = {
+            "df": df,
+            "current_price": latest['close'],
+            "rsi_val": latest['RSI_6'],
+            "lower_bb": latest[lower_bb_col],
+            "upper_bb": latest[upper_bb_col],
+            "lower_bb_col": lower_bb_col,
+            "upper_bb_col": upper_bb_col,
+        }
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch data for {symbol}: {e}")
+
+# ================================================================
+# 5. CHECK ALL POSITIONS (Only 1 allowed at a time)
+# ================================================================
+current_position_symbol = None
+current_qty = 0
+unrealized_pl = 0.0
+entry_price = 0.0
+
+for symbol in TICKERS:
+    try:
+        position = trading_client.get_open_position(symbol)
+        current_position_symbol = symbol
+        current_qty = float(position.qty)
+        unrealized_pl = float(position.unrealized_pl)
+        entry_price = float(position.avg_entry_price)
+        break
+    except Exception:
+        continue
+
+# ================================================================
+# 6. BUILD COMBINED TRADE LEDGER (All tickers, one equity curve)
+# ================================================================
+all_symbols = list(TICKERS.keys())
 orders_req = GetOrdersRequest(
     status=QueryOrderStatus.CLOSED,
-    symbols=["NRDS"],
+    symbols=all_symbols,
     limit=500
 )
 closed_orders = trading_client.get_orders(filter=orders_req)
@@ -79,6 +192,7 @@ for o in closed_orders:
     if o.filled_qty and float(o.filled_qty) > 0:
         trade_data.append({
             "Time": o.filled_at.astimezone(EST).strftime("%Y-%m-%d %H:%M:%S"),
+            "Symbol": o.symbol,
             "Side": o.side.name,
             "Qty": float(o.filled_qty),
             "Avg Price": float(o.filled_avg_price),
@@ -89,188 +203,263 @@ ledger_df = pd.DataFrame(trade_data)
 if not ledger_df.empty:
     ledger_df = ledger_df.sort_values("Time").reset_index(drop=True)
 
-# Calculate Equity Curve compounding from $300
-current_challenge_equity = 300.00
-equity_curve = [{"Time": start_time.strftime("%Y-%m-%d %H:%M:%S"), "Equity": 300.00}]
+# Calculate unified equity curve across all tickers
+current_challenge_equity = SEED_CAPITAL
+equity_curve = [{"Time": start_time.strftime("%Y-%m-%d %H:%M:%S"), "Equity": SEED_CAPITAL}]
 
 if not ledger_df.empty:
-    holdings = 0
-    avg_cost = 0
+    holdings = {}
     realized_pnl = 0
     for idx, row in ledger_df.iterrows():
+        sym = row["Symbol"]
         qty = row["Qty"]
         price = row["Avg Price"]
+
+        if sym not in holdings:
+            holdings[sym] = {"qty": 0, "avg_cost": 0}
+
         if row["Side"] == "BUY":
-            total_cost = (holdings * avg_cost) + (qty * price)
-            holdings += qty
-            avg_cost = total_cost / holdings
+            total_cost = (holdings[sym]["qty"] * holdings[sym]["avg_cost"]) + (qty * price)
+            holdings[sym]["qty"] += qty
+            if holdings[sym]["qty"] > 0:
+                holdings[sym]["avg_cost"] = total_cost / holdings[sym]["qty"]
         elif row["Side"] == "SELL":
-            trade_pnl = (price - avg_cost) * qty
+            trade_pnl = (price - holdings[sym]["avg_cost"]) * qty
             realized_pnl += trade_pnl
-            holdings -= qty
-            if holdings == 0:
-                avg_cost = 0
+            holdings[sym]["qty"] -= qty
+            if holdings[sym]["qty"] == 0:
+                holdings[sym]["avg_cost"] = 0
             equity_curve.append({
                 "Time": row["Time"],
-                "Equity": 300.00 + realized_pnl
+                "Equity": SEED_CAPITAL + realized_pnl
             })
-    current_challenge_equity = 300.00 + realized_pnl
+    current_challenge_equity = SEED_CAPITAL + realized_pnl
 
 equity_df = pd.DataFrame(equity_curve)
 
-# Current Position Check (includes entry price for profit target)
-try:
-    position = trading_client.get_open_position('NRDS')
-    current_qty = float(position.qty)
-    unrealized_pl = float(position.unrealized_pl)
-    entry_price = float(position.avg_entry_price)
-except Exception:
-    current_qty = 0
-    unrealized_pl = 0.0
-    entry_price = 0.0
+# ================================================================
+# 7. SIGNAL LOGIC FOR ALL TICKERS
+#
+# Rules:
+#   - Only ONE position at a time across ALL tickers
+#   - If we're flat (no position), scan all tickers for BUY signals
+#   - If multiple BUY signals fire, the first ticker in TICKERS wins
+#   - If we're holding, only that ticker can fire a SELL signal
+# ================================================================
+signals = {}
+buy_candidate = None
 
-# Max-Buy Compounding Logic
-qty_to_buy = int(current_challenge_equity // current_price) if current_price > 0 else 0
+for symbol, config in TICKERS.items():
+    if symbol not in ticker_data:
+        signals[symbol] = {"signal": "ERROR", "reason": "Data fetch failed."}
+        continue
 
-# --- 6. EARNINGS BLACKOUT & SIGNAL LOGIC ---
-BLACKOUT_START = EST.localize(datetime.datetime(2026, 5, 4, 0, 0, 0))
-BLACKOUT_END = EST.localize(datetime.datetime(2026, 5, 13, 23, 59, 59))
-is_blackout_active = BLACKOUT_START <= end_time <= BLACKOUT_END
+    td = ticker_data[symbol]
+    price = td["current_price"]
+    rsi = td["rsi_val"]
+    lower_bb = td["lower_bb"]
+    upper_bb = td["upper_bb"]
 
-# ============================================================
-# TUNING PARAMETERS (Calibrated for NRDS 1-min micro-scalping)
-# ============================================================
-RSI_BUY = 35          # Buy when RSI dips below this
-RSI_SELL = 65         # Sell when RSI rises above this
-PROFIT_TARGET = 0.08  # Take profit at +$0.08/share gain
-# No hard stop loss - mean reversion needs room to breathe.
-# Risk is managed by: earnings blackout, profit target, RSI/BB
-# exits, max-buy sizing, and paper account calibration.
-# ============================================================
+    # Check earnings blackout for this ticker
+    is_blackout = False
+    if config["blackout_start"] and config["blackout_end"]:
+        is_blackout = config["blackout_start"] <= end_time <= config["blackout_end"]
 
-signal = "HOLD"
-reason = "Awaiting technical triggers."
+    signal = "HOLD"
+    reason = "Awaiting technical triggers."
 
-if is_blackout_active:
-    st.error("⚠️ **EARNINGS BLACKOUT ACTIVE (May 4 - May 13)**")
-    if current_qty > 0:
-        signal = "SELL_LIQUIDATE"
-        reason = "🚨 Blackout triggered. Liquidating open position to protect capital."
+    if is_blackout:
+        if current_position_symbol == symbol and current_qty > 0:
+            signal = "SELL_LIQUIDATE"
+            reason = f"🚨 Earnings blackout active. Liquidating {symbol}."
+        else:
+            signal = "STANDBY"
+            reason = f"Earnings blackout active for {symbol}."
     else:
-        signal = "STANDBY"
-        reason = "Bot paused for earnings. Manual trading enabled."
-else:
-    # -----------------------------------------------------------
-    # MEAN REVERSION LOGIC (TUNED FOR 1-MIN SCALPING)
-    #
-    # ENTRY (BUY) - OR logic, either condition triggers:
-    #   - RSI(6) drops below 35 (oversold momentum)
-    #   - Price drops below Lower Bollinger Band (price extreme)
-    #
-    # EXIT (SELL) - OR logic, ANY condition triggers:
-    #   1. Profit target hit: up $0.08/share from entry
-    #   2. RSI(6) rises above 65 (overbought momentum)
-    #   3. Price rises above Upper Bollinger Band (price extreme)
-    # -----------------------------------------------------------
-
-    if current_qty == 0 and (rsi_val < RSI_BUY or current_price < lower_bb):
-        signal = "BUY"
-        reasons = []
-        if rsi_val < RSI_BUY:
-            reasons.append(f"RSI ({rsi_val:.2f}) < {RSI_BUY}")
-        if current_price < lower_bb:
-            reasons.append(f"Price (${current_price:.2f}) < Lower BB (${lower_bb:.2f})")
-        reason = "BUY Signal: " + " | ".join(reasons)
-
-    elif current_qty > 0:
-        # Calculate per-share P&L from Alpaca's entry price
-        pnl_per_share = current_price - entry_price
-
-        # Exit Priority 1: Profit target hit
-        if pnl_per_share >= PROFIT_TARGET:
-            signal = "SELL"
-            reason = f"💰 PROFIT TARGET HIT: +${pnl_per_share:.2f}/share (target: +${PROFIT_TARGET:.2f})"
-
-        # Exit Priority 2: Technical overbought signals
-        elif rsi_val > RSI_SELL or current_price > upper_bb:
-            signal = "SELL"
+        # BUY: only if we have ZERO open positions anywhere
+        if current_position_symbol is None and (rsi < config["rsi_buy"] or price < lower_bb):
+            signal = "BUY"
             reasons = []
-            if rsi_val > RSI_SELL:
-                reasons.append(f"RSI ({rsi_val:.2f}) > {RSI_SELL}")
-            if current_price > upper_bb:
-                reasons.append(f"Price (${current_price:.2f}) > Upper BB (${upper_bb:.2f})")
-            reason = "SELL Signal: " + " | ".join(reasons)
+            if rsi < config["rsi_buy"]:
+                reasons.append(f"RSI ({rsi:.2f}) < {config['rsi_buy']}")
+            if price < lower_bb:
+                reasons.append(f"Price (${price:.2f}) < Lower BB (${lower_bb:.2f})")
+            reason = "BUY Signal: " + " | ".join(reasons)
 
-# --- 7. ORDER EXECUTION ---
-if signal == "BUY" and qty_to_buy > 0:
-    try:
-        buy_order = MarketOrderRequest(
-            symbol="NRDS",
-            qty=qty_to_buy,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY
-        )
-        trading_client.submit_order(order_data=buy_order)
-        st.success(f"Executed BUY for {qty_to_buy} shares at ~${current_price:.2f}")
-    except Exception as e:
-        st.error(f"Buy failed: {e}")
+        # SELL: only if THIS ticker is the one we're holding
+        elif current_position_symbol == symbol and current_qty > 0:
+            pnl_per_share = price - entry_price
 
-elif signal in ["SELL", "SELL_LIQUIDATE"] and current_qty > 0:
-    try:
-        sell_order = MarketOrderRequest(
-            symbol="NRDS",
-            qty=current_qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY
-        )
-        trading_client.submit_order(order_data=sell_order)
-        st.success(f"Executed SELL for {int(current_qty)} shares. {reason}")
-    except Exception as e:
-        st.error(f"Sell failed: {e}")
+            # Exit Priority 1: Profit target
+            if pnl_per_share >= config["profit_target"]:
+                signal = "SELL"
+                reason = f"💰 PROFIT TARGET HIT: +${pnl_per_share:.2f}/share (target: +${config['profit_target']:.2f})"
 
-# --- 8. DASHBOARD UI ---
-st.subheader("🏆 $300 Challenge Metrics")
-colA, colB, colC = st.columns(3)
-colA.metric("Starting Capital", "$300.00")
-colB.metric("Challenge Equity", f"${current_challenge_equity:.2f}", f"${current_challenge_equity - 300.00:.2f} PnL")
-colC.metric("Open Position PnL", f"${unrealized_pl:.2f}", f"{int(current_qty)} Shares")
+            # Exit Priority 2: Technical overbought
+            elif rsi > config["rsi_sell"] or price > upper_bb:
+                signal = "SELL"
+                reasons = []
+                if rsi > config["rsi_sell"]:
+                    reasons.append(f"RSI ({rsi:.2f}) > {config['rsi_sell']}")
+                if price > upper_bb:
+                    reasons.append(f"Price (${price:.2f}) > Upper BB (${upper_bb:.2f})")
+                reason = "SELL Signal: " + " | ".join(reasons)
+
+    signals[symbol] = {"signal": signal, "reason": reason}
+
+    # Track the first BUY candidate (priority = order in TICKERS dict)
+    if signal == "BUY" and buy_candidate is None:
+        buy_candidate = symbol
+
+# ================================================================
+# 8. ORDER EXECUTION
+# ================================================================
+
+# Execute BUY on the highest-priority ticker that fired
+if buy_candidate and buy_candidate in ticker_data:
+    price = ticker_data[buy_candidate]["current_price"]
+    qty_to_buy = int(current_challenge_equity // price) if price > 0 else 0
+    if qty_to_buy > 0:
+        try:
+            buy_order = MarketOrderRequest(
+                symbol=buy_candidate,
+                qty=qty_to_buy,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY
+            )
+            trading_client.submit_order(order_data=buy_order)
+            st.success(f"✅ Executed BUY: {qty_to_buy} shares of **{buy_candidate}** at ~${price:.2f}")
+        except Exception as e:
+            st.error(f"Buy failed for {buy_candidate}: {e}")
+
+# Execute SELL on whichever ticker we're holding
+for symbol, sig_data in signals.items():
+    if sig_data["signal"] in ["SELL", "SELL_LIQUIDATE"] and current_position_symbol == symbol and current_qty > 0:
+        try:
+            sell_order = MarketOrderRequest(
+                symbol=symbol,
+                qty=current_qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY
+            )
+            trading_client.submit_order(order_data=sell_order)
+            st.success(f"✅ Executed SELL: {int(current_qty)} shares of **{symbol}**. {sig_data['reason']}")
+        except Exception as e:
+            st.error(f"Sell failed for {symbol}: {e}")
+
+# ================================================================
+# 9. DASHBOARD UI - PORTFOLIO OVERVIEW
+# ================================================================
+st.subheader("🏆 Portfolio Overview")
+colA, colB, colC, colD = st.columns(4)
+colA.metric("Starting Capital", f"${SEED_CAPITAL:.2f}")
+colB.metric("Challenge Equity", f"${current_challenge_equity:.2f}", f"${current_challenge_equity - SEED_CAPITAL:.2f} PnL")
+
+if current_position_symbol:
+    colC.metric("Holding", f"{current_position_symbol}", f"{int(current_qty)} Shares")
+    colD.metric("Open PnL", f"${unrealized_pl:.2f}")
+else:
+    colC.metric("Holding", "None", "Scanning all tickers...")
+    colD.metric("Open PnL", "$0.00")
+
+# Show profit target when holding a position
+if current_position_symbol and entry_price > 0:
+    target = TICKERS[current_position_symbol]["profit_target"]
+    st.info(f"📍 Holding **{current_position_symbol}** | Entry: ${entry_price:.2f} | 🎯 Target: ${entry_price + target:.2f} (+${target:.2f}/share)")
 
 st.markdown("---")
 
-st.subheader("Live Market Signals")
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Current Price", f"${current_price:.2f}")
-col2.metric("Target Buy Qty (Max Buy)", f"{qty_to_buy} Shares")
-col3.metric("RSI (6)", f"{rsi_val:.2f}")
-col4.metric("Current Signal", signal)
-st.write(f"**Bot Status:** {reason}")
+# ================================================================
+# 10. SIGNAL SCANNER - All tickers at a glance
+# ================================================================
+st.subheader("📡 Signal Scanner")
+signal_cols = st.columns(len(TICKERS))
 
-# Show profit target when holding a position
-if current_qty > 0 and entry_price > 0:
-    st.info(f"📍 Entry: ${entry_price:.2f} | 🎯 Profit Target: ${entry_price + PROFIT_TARGET:.2f}")
+for i, (symbol, sig_data) in enumerate(signals.items()):
+    sig = sig_data["signal"]
+    with signal_cols[i]:
+        if symbol in ticker_data:
+            price = ticker_data[symbol]["current_price"]
+            rsi = ticker_data[symbol]["rsi_val"]
+            if sig == "BUY":
+                st.success(f"**{symbol}**\n\n${price:.2f}\n\nRSI: {rsi:.1f}\n\n🟢 **{sig}**")
+            elif sig in ["SELL", "SELL_LIQUIDATE"]:
+                st.error(f"**{symbol}**\n\n${price:.2f}\n\nRSI: {rsi:.1f}\n\n🔴 **{sig}**")
+            elif sig == "STANDBY":
+                st.warning(f"**{symbol}**\n\n${price:.2f}\n\nRSI: {rsi:.1f}\n\n⚠️ **BLACKOUT**")
+            else:
+                st.info(f"**{symbol}**\n\n${price:.2f}\n\nRSI: {rsi:.1f}\n\n⏳ **{sig}**")
+        else:
+            st.error(f"**{symbol}**\n\n❌ DATA ERROR")
 
-# --- 9. TABS & PLOTLY CHARTS ---
-tab1, tab2, tab3 = st.tabs(["Live Chart (1 Min)", "Challenge Equity Curve", "Trade Log"])
+st.markdown("---")
 
-with tab1:
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index,
-                    open=df['open'], high=df['high'],
-                    low=df['low'], close=df['close'],
-                    name='Price'))
-    fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], line=dict(color='orange', width=2), name='VWAP'))
-    fig.add_trace(go.Scatter(x=df.index, y=df[upper_bb_col], line=dict(color='gray', width=1, dash='dash'), name='Upper BB'))
-    fig.add_trace(go.Scatter(x=df.index, y=df[lower_bb_col], line=dict(color='gray', width=1, dash='dash'), name='Lower BB', fill='tonexty', fillcolor='rgba(128,128,128,0.1)'))
-    fig.update_layout(title="NRDS Live Chart - 1 Min", xaxis_title="Time", yaxis_title="Price ($)", template="plotly_dark", xaxis_rangeslider_visible=False, height=600)
-    st.plotly_chart(fig, use_container_width=True)
+# ================================================================
+# 11. PER-TICKER TABS + EQUITY CURVE + TRADE LOG
+# ================================================================
+tab_names = list(TICKERS.keys()) + ["📈 Equity Curve", "📋 Trade Log"]
+tabs = st.tabs(tab_names)
 
-with tab2:
+# Individual ticker tabs with charts and stats
+for i, symbol in enumerate(TICKERS.keys()):
+    with tabs[i]:
+        if symbol not in ticker_data:
+            st.error(f"No data available for {symbol}.")
+            continue
+
+        td = ticker_data[symbol]
+        config = TICKERS[symbol]
+        sig_data = signals[symbol]
+        df = td["df"]
+
+        # Metrics row
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Price", f"${td['current_price']:.2f}")
+        col2.metric("RSI (6)", f"{td['rsi_val']:.2f}")
+        col3.metric("Signal", sig_data["signal"])
+        qty_possible = int(current_challenge_equity // td["current_price"]) if td["current_price"] > 0 else 0
+        col4.metric("Max Buy Qty", f"{qty_possible}")
+
+        st.write(f"**Status:** {sig_data['reason']}")
+        st.write(f"**Tuning:** BB(20, {config['bb_std']}) | RSI Buy < {config['rsi_buy']} | RSI Sell > {config['rsi_sell']} | Profit Target: ${config['profit_target']:.2f}")
+
+        # Candlestick chart
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df['open'], high=df['high'],
+            low=df['low'], close=df['close'], name='Price'))
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['VWAP'],
+            line=dict(color='orange', width=2), name='VWAP'))
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df[td["upper_bb_col"]],
+            line=dict(color='gray', width=1, dash='dash'), name='Upper BB'))
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df[td["lower_bb_col"]],
+            line=dict(color='gray', width=1, dash='dash'), name='Lower BB',
+            fill='tonexty', fillcolor='rgba(128,128,128,0.1)'))
+        fig.update_layout(
+            title=f"{symbol} Live Chart - 1 Min",
+            xaxis_title="Time", yaxis_title="Price ($)",
+            template="plotly_dark",
+            xaxis_rangeslider_visible=False, height=500)
+        st.plotly_chart(fig, use_container_width=True)
+
+# Equity Curve tab
+with tabs[-2]:
     fig_eq = go.Figure()
-    fig_eq.add_trace(go.Scatter(x=equity_df["Time"], y=equity_df["Equity"], mode='lines+markers', name='Equity', line=dict(color='#00FF00', width=3)))
-    fig_eq.update_layout(title="Compounding Growth from $300 Seed", xaxis_title="Time", yaxis_title="Account Equity ($)", template="plotly_dark", height=500)
+    fig_eq.add_trace(go.Scatter(
+        x=equity_df["Time"], y=equity_df["Equity"],
+        mode='lines+markers', name='Equity',
+        line=dict(color='#00FF00', width=3)))
+    fig_eq.update_layout(
+        title=f"Compounding Growth from ${SEED_CAPITAL:.0f} Seed (All Tickers)",
+        xaxis_title="Time", yaxis_title="Account Equity ($)",
+        template="plotly_dark", height=500)
     st.plotly_chart(fig_eq, use_container_width=True)
 
-with tab3:
+# Trade Log tab
+with tabs[-1]:
     if not ledger_df.empty:
         st.dataframe(ledger_df, use_container_width=True)
     else:
